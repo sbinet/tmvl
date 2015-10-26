@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -111,6 +112,8 @@ func (sim *Sim) Simulate(ievt int, results chan<- Result) {
 }
 
 func writeResults(f io.Writer, input <-chan Result, errc chan<- error) {
+	w := bufio.NewWriter(f)
+	defer w.Flush()
 	for res := range input {
 		_, err := f.Write(res.Data)
 		if err != nil {
