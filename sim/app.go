@@ -85,6 +85,16 @@ func main(f func(*App)) {
 			log.Fatalf("error: %v\n", err)
 		}
 	}
+	close(app.resc)
+	close(app.errc)
+
+	err = fout.Close()
+	if err != nil {
+		log.Fatalf("error closing output file [%s]: %v\n",
+			app.fname,
+			err,
+		)
+	}
 }
 
 func (app *App) Errors() chan<- error {
