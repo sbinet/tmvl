@@ -9,13 +9,19 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"runtime/pprof"
+	"runtime/trace"
 )
 
 var (
-	nevts  = flag.Int("nevts", 100, "number of events to compute")
-	ievt   = flag.Int("ievt", 0, "first event of the event loop")
-	fname  = flag.String("o", "hpcsim.out", "path to output file to write")
-	simpkg = flag.String("sim", "", "fully qualified name of the package to run")
+	nthreads = flag.Int("t", 1, "number of concurrent goroutines")
+	nevts    = flag.Int("nevts", 100, "number of events to compute")
+	ievt     = flag.Int("ievt", 0, "first event of the event loop")
+	fname    = flag.String("o", "hpcsim.out", "path to output file to write")
+	simpkg   = flag.String("sim", "", "fully qualified name of the package to run")
+
+	doprof  = flag.Bool("prof", false, "enable CPU profiling")
+	dotrace = flag.Bool("trace", false, "enable tracing")
 )
 
 type Result struct {
@@ -49,6 +55,29 @@ type Proc interface {
 func main() {
 	flag.Parse()
 
+	if *doprof {
+		fprof, err := os.Create("prof.out")
+		if err != nil {
+			log.Fatalf("error creating pprof output file: %v\n", err)
+		}
+		defer fprof.Close()
+		pprof.StartCPUProfile(fprof)
+		defer pprof.StopCPUProfile()
+	}
+
+	if *dotrace {
+		ftrace, err := os.Create("trace.out")
+		if err != nil {
+			log.Fatalf("error creating trace output file: %v\n", err)
+		}
+		defer ftrace.Close()
+		err = trace.Start(ftrace)
+		if err != nil {
+			log.Fatalf("error starting tracer: %v\n", err)
+		}
+		defer trace.Stop()
+	}
+
 	sim := Sim{
 		NEvts: *nevts,
 		IEvt:  *ievt,
@@ -68,8 +97,8 @@ func main() {
 	}
 	defer f.Close()
 
-	errc := make(chan error)
-	results := make(chan Result)
+	errc := make(chan error, *nthreads)
+	results := make(chan Result, *nthreads)
 	go writeResults(f, results, errc)
 
 	//go sim.Run(results)
