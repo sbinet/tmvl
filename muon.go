@@ -5,17 +5,16 @@ import (
 	"math"
 	"math/rand"
 
+	"github.com/go-hep/fmom"
 	"github.com/sbinet/tmvl/pumas"
 )
 
 const NMax = 3
 
-type Vec3f64 [NMax]float64
-
 type Muon struct {
 	Energy    float64
-	Direction Vec3f64
-	Position  Vec3f64
+	Direction fmom.Vec3
+	Position  fmom.Vec3
 	Charge    int
 	Distance  float64
 	Time      float64
@@ -104,8 +103,8 @@ func (mu *Muon) propagate(geo Geometry) error {
 
 type Result struct {
 	ID        [sha512.Size384]byte
-	Position  Vec3f64
-	Direction Vec3f64
+	Position  fmom.Vec3
+	Direction fmom.Vec3
 	Energy    float64
 	Time      float64
 	Distance  float64
