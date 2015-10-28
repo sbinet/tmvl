@@ -92,12 +92,25 @@ func (mu *Muon) generate() error {
 }
 
 func (mu *Muon) propagate(geo Geometry) error {
-	var err error
-	mu.Energy, mu.Distance, mu.Time = mu.ctx.Propagate(
-		float64(mu.Charge), mu.Energy,
-		mu.Position, mu.Direction,
-		mu.Distance, mu.Time, 1, 1,
+	state, err := mu.ctx.Propagate(
+		float64(mu.Charge),
+		pumas.State{
+			Kinetic:   mu.Energy,
+			Distance:  mu.Distance,
+			Time:      mu.Time,
+			Position:  mu.Position,
+			Direction: mu.Direction,
+		},
+		1, 1,
 	)
+	if err != nil {
+		return err
+	}
+	mu.Energy = state.Kinetic
+	mu.Distance = state.Distance
+	mu.Time = state.Time
+	mu.Position = state.Position
+	mu.Direction = state.Direction
 	return err
 }
 
