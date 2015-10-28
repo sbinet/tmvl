@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/andrebq/gas"
 )
 
 const (
@@ -534,7 +536,8 @@ func parseDensity(line string) (float64, error) {
 }
 
 func init() {
-	err := loadTables("/home/binet/dev/tomuvol/go/src/github.com/sbinet/tmvl/pumas/data/physics/pdg/2013")
+	dir := gas.MustAbs("github.com/sbinet/tmvl/pumas/data/physics/pdg/2013")
+	err := loadTables(dir)
 	if err != nil {
 		log.Fatalf("pumas: error loading data tables: %v\n", err)
 	}
