@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/andrebq/gas"
+	"github.com/go-hep/fmom"
 )
 
 const (
@@ -19,6 +20,7 @@ const (
 	numMaterials = 5
 	numElements  = 14
 	numTaylor    = 8
+	maxComps     = 10
 )
 
 type elementType struct {
@@ -533,6 +535,510 @@ func parseDensity(line string) (float64, error) {
 
 	density *= 1000 // convert to kg/m^3
 	return density, err
+}
+
+// grammage returns the total grammage (in kg/m^2) seen by a muon for the given
+// material and initial kinetic energy
+func grammage(mat MaterialKind, kinetic float64) float64 {
+	if kinetic < physK[0] {
+		return 0
+	}
+	if kinetic >= physK[numPDG-1] {
+		// constant loss model
+		material := materials[mat]
+		k0 := physK[numPDG-1]
+		k1 := material.amax/material.bmax - muon.Mass
+		return material.x[numPDG-1] + 1/material.bmax*math.Log((kinetic-k1)/(k0-k1))
+	}
+
+	return linearInterpolate(physK[:], materials[mat].x[:], kinetic)
+}
+
+// linearInterpolate implements a linear interpolation
+func linearInterpolate(xs, ys []float64, x float64) float64 {
+	i1 := getIndex(xs, x)
+	i2 := i1 + 1
+
+	h := (x - xs[i1]) / (xs[i2] - xs[i1])
+	return ys[i1] + h*(ys[i2]-ys[i1])
+}
+
+// getIndex returns the index (into xs) for the value x, using dichotomy
+func getIndex(xs []float64, x float64) int {
+	if x < xs[0] {
+		return -1
+	}
+	imax := len(xs) - 1
+	if x >= xs[imax] {
+		return imax
+	}
+
+	i1, _ := refineBracket(xs, x, 0, imax)
+	return i1
+}
+
+func refineBracket(xs []float64, x float64, p1, p2 int) (int, int) {
+	i := (p1 + p2) / 2
+
+	if x >= xs[i] {
+		p1 = i
+	} else {
+		p2 = i
+	}
+
+	if p2-p1 >= 2 {
+		return refineBracket(xs, x, p1, p2)
+	}
+	return p1, p2
+}
+
+// lengthLimit returns the length limit (if any) for the propagation with
+// a locator.
+func (ctx *Context) lengthLimit(fwd int, ki, xi float64, mat MaterialKind, density float64) (float64, bool) {
+	length := -1.0
+	switch {
+	case fwd != 0 && ctx.Kinetic.Min > 0:
+		if ki <= ctx.Kinetic.Min {
+			return length, false
+		}
+		length = (xi - grammage(mat, ctx.Kinetic.Min)) / density
+
+	case fwd == 0 && ctx.Kinetic.Max > 0:
+		if ki >= ctx.Kinetic.Max {
+			return length, false
+		}
+		length = (grammage(mat, ctx.Kinetic.Max) - xi) / density
+	}
+	return length, true
+}
+
+// stepThrough performs a unit step through a medium.
+// stepThrough returns the index of the end step medium or a negative value if
+// a boundary condition was reached.
+func (ctx *Context) stepThrough(locator Locator, media []Medium, length float64, mediumIndex int, charge float64, state *State, scattering, fwd int) int {
+
+	idist := state.Distance
+	e := state.Kinetic + muon.Mass
+	p := math.Sqrt(e*e - muon.Mass*muon.Mass)
+	b := p / e
+	medium := media[mediumIndex]
+	material := medium.Material
+	density := medium.Density
+
+	// compute the Larmor radius and magnetic deflection direction
+	rLarmor := 0.0
+	var uT fmom.Vec3
+	if medium.Magnetized {
+		B := medium.Magnet
+		uT[0] = state.Direction[1]*B[2] - state.Direction[2]*B[1]
+		uT[1] = state.Direction[2]*B[0] - state.Direction[0]*B[2]
+		uT[2] = state.Direction[0]*B[1] - state.Direction[1]*B[0]
+		BT := math.Sqrt(uT[0]*uT[0] + uT[1]*uT[1] + uT[2]*uT[2])
+		iBT := 1.0 / BT
+		rLarmor = p * iBT / physKLarmor
+		uT[0] *= iBT
+		uT[1] *= iBT
+		uT[2] *= iBT
+	}
+
+	// randomize the next hard collision
+	var (
+		t         float64
+		screening [maxComps]float64
+		lambda    [maxComps]float64
+		mu0       float64
+		ihard     int
+	)
+	if scattering != 0 {
+		// compute the mean free paths and screening factors
+		var (
+			invlbM  float64
+			invlb1M float64
+			sML     float64
+			sMH     float64
+		)
+		for i := 0; i < materials[material].numElem; i++ {
+			comp := materials[material].comp[i]
+			elem := elements[comp.elem]
+			s := moliereScreening(p, b, elem.z)
+			lb := wentzelPath(p, b, elem.z, elem.z, s) / (density * comp.frac)
+			invlb := 1.0 / lb
+			invlbM += invlb
+			invlb1M += wentzelTransport1(s) * invlb
+
+			sMH += s * invlb
+			sML += 1.0 / (s * lb)
+			screening[i] = s
+			lambda[i] = lb
+		}
+
+		// set the hard scattering mean free path
+		lbM := 1.0 / invlbM
+		lbH := 0.0
+		{
+			lbH = ctx.TransportRatio / invlb1M
+			if lbH > ctx.Step.Max {
+				lbH = ctx.Step.Max
+			}
+			lambdaK := ctx.EnergyLossRatio * state.Kinetic / (energyLoss(material, state.Kinetic) * density)
+			if lbH > lambdaK {
+				lbH = lambdaK
+			}
+			if rLarmor > 0 {
+				lambdaB := rLarmor * ctx.MagneticRatio
+				if lbH > lambdaB {
+					lbH = lambdaB
+				}
+			}
+		}
+
+		// compute the hard scattering cut-off angle
+		if lbM > lbH {
+			lbH = lbM
+			mu0 = 0
+		} else {
+			sM := 0.0 // effective screening factor
+			if lbH > 2*lbM {
+				sM = sMH * lbM // asymptotic value for lbH >> lbM
+			} else {
+				sM = 1 / (sML * lbM)
+			}
+			mu0 = sM * (lbH - lbM) / (sM*lbH + lbM) // Asymptotic value for lbH ~= lbM
+			// the former asymptotic approximation yields better than 1 percent
+			// relative accuracy on mu.
+			// we could further improve the result with a few newtonian
+			// iterations
+		}
+		t = -lbH * math.Log(ctx.Rand.Float64())
+
+		// randomize the hard scatterer element
+		{
+			zeta := ctx.Rand.Float64()
+			invlb := 0.0
+			for i := 0; i < materials[material].numElem; i++ {
+				ihard = i
+				invlb += 1.0 / lambda[i]
+				if zeta*invlbM <= invlb {
+					break
+				}
+			}
+		}
+
+	} else {
+		// disable the soft scattering
+		mu0 = 0
+
+		// set the step path
+		lambdaK := ctx.EnergyLossRatio * state.Kinetic / (energyLoss(material, state.Kinetic) * density)
+		t = ctx.Step.Max
+		if t > lambdaK {
+			t = lambdaK
+		}
+		if rLarmor > 0 {
+			lambdaB := rLarmor * ctx.MagneticRatio
+			if t > lambdaB {
+				t = lambdaB
+			}
+		}
+	}
+
+	// do the soft scattering step
+	tau := 0.0
+	if mu0 == 0 {
+		tau = 0.0
+	} else {
+		// randomize the virtual soft scattering vertex
+		tau = ctx.Rand.Float64() * t
+
+		// update the position
+		{
+			newIndex := ctx.updateStepPosition(locator, medium, length, mediumIndex, tau, state, fwd)
+			if newIndex != mediumIndex {
+				return newIndex
+			}
+		}
+
+		// update the direction
+		{
+			ctS := 0.0
+			mu1 := 0.0
+			varMu := 0.0
+			lb1 := 0.0
+			lb2 := 0.0
+			for i := 0; i < materials[material].numElem; i++ {
+				si := screening[i]
+				lbi := lambda[i]
+				C := (si * (1 + si)) / lbi
+				r := mu0 / (si + mu0)
+				L := math.Log((si + mu0) / si)
+				lb1 += 2 * C * (L - r)
+				lb2 += 6 * C * ((1+2*si)*L - (1+2*si+mu0)*r)
+			}
+
+			if (lb1 <= 0) || (lb2 <= 0) {
+				mu1 = 0
+				varMu = 0
+			} else {
+				lb1 = 1 / lb1
+				lb2 = 1 / lb2
+				mu1 = 0.5 * (1 - math.Exp(-t/lb1))
+				varMu = 0.25 * ((1+2*math.Exp(-t/lb2))/3 - math.Exp(-2*t/lb1))
+				if varMu < 0 {
+					varMu = 0
+				}
+			}
+
+			// randomize the soft scattering cosine
+			if mu1 > 0 {
+				zeta := ctx.Rand.Float64()
+				omu := 1 - mu1
+				alpha := varMu / (mu1 * omu)
+				alpha = (3*alpha + math.Sqrt(alpha*(alpha+8))) / (4 * (1 - alpha))
+				if zeta < omu {
+					ctS = 1 - 2*mu1*math.Pow(zeta/omu, alpha)
+				} else {
+					ctS = 2*omu*math.Pow((1-zeta)/mu1, alpha) - 1
+				}
+			}
+
+			// update the direction
+			if ctS > 0 {
+				ctx.rotateStepDirection(ctS, state)
+			}
+		}
+	}
+
+	// propagate to the step end vertex
+	{
+		newIndex := ctx.updateStepPosition(locator, medium, length, mediumIndex, t-tau, state, fwd)
+
+		// apply the magnetic rotation
+		if rLarmor != 0 {
+			u := state.Direction
+			theta := 2 * float64(fwd-1) * charge * (state.Distance - idist) / rLarmor
+			sin := math.Sin(theta)
+			cos := math.Cos(theta)
+			state.Direction[0] = cos*u[0] + sin*uT[0]
+			state.Direction[1] = cos*u[1] + sin*uT[1]
+			state.Direction[2] = cos*u[2] + sin*uT[2]
+		}
+
+		if newIndex != mediumIndex {
+			return newIndex
+		}
+	}
+
+	// apply the hard scattering
+	if scattering != 0 {
+		zeta := ctx.Rand.Float64()
+		s := screening[ihard]
+		ctH := 1 - 2*(mu0+(s+mu0)*zeta*(1-mu0)/(s+1-zeta*(1-mu0)))
+		ctx.rotateStepDirection(ctH, state)
+	}
+
+	return mediumIndex
+}
+
+// updateStepPosition updates the step point position and direction.
+// updateStepPosition returns the index of the end step medium or a negative
+// value if a boundary condition was reached.
+func (ctx *Context) updateStepPosition(locator Locator, medium Medium, length float64, mediumIndex int, step float64, state *State, fwd int) int {
+
+	endMedium := mediumIndex
+	if length > 0 {
+		// check the total length boundary condition
+		d := length - state.Distance
+		if d <= step {
+			step = d
+			endMedium = -1
+		}
+	}
+	step *= 2 * float64(fwd-1)
+
+	if locator != nil {
+		// check for a change of medium
+		state.Position[0] += step * state.Direction[0]
+		state.Position[1] += step * state.Direction[1]
+		state.Position[2] += step * state.Direction[2]
+
+		index := locator(ctx, state.Position)
+		if index != mediumIndex {
+			// locate the medium change by dichotomy
+			s1 := 0.0
+			s2 := -step
+			for math.Abs(s1-s2) > ctx.Step.Min {
+				s3 := 0.5 * (s1 + s2)
+				x := state.Position[0] + s3*state.Direction[0]
+				y := state.Position[1] + s3*state.Direction[1]
+				z := state.Position[2] + s3*state.Direction[2]
+				if locator(ctx, fmom.Vec3{x, y, z}) != index {
+					s1 = s3
+				} else {
+					s2 = s3
+				}
+			}
+			state.Position[0] += s1 * state.Direction[0]
+			state.Position[1] += s1 * state.Direction[1]
+			state.Position[2] += s1 * state.Direction[2]
+			step += s1
+			if endMedium >= 0 {
+				endMedium = index
+			}
+		}
+	} else {
+		state.Position[0] += step * state.Direction[0]
+		state.Position[1] += step * state.Direction[1]
+		state.Position[2] += step * state.Direction[2]
+	}
+
+	state.Distance += math.Abs(step)
+
+	return mediumIndex
+}
+
+// rotateStepDirection rotates the step direction using an arbitrary phase
+// origin for phi.
+func (ctx *Context) rotateStepDirection(ct float64, state *State) {
+	// check the numerical sine
+	stsq := 1 - ct*ct
+	if stsq <= 0 {
+		return
+	}
+
+	st := math.Sqrt(stsq)
+
+	// select the co-vectors for the local basis
+	var (
+		u0 fmom.Vec3
+		a  = fmom.Vec3{
+			math.Abs(state.Direction[0]),
+			math.Abs(state.Direction[1]),
+			math.Abs(state.Direction[2]),
+		}
+	)
+	if a[0] > a[1] {
+		if a[0] > a[2] {
+			nrm := 1 / math.Sqrt(state.Direction[0]*state.Direction[0]+state.Direction[2]*state.Direction[2])
+			u0[0] = -nrm * state.Direction[2]
+			u0[2] = +nrm * state.Direction[0]
+		} else {
+			nrm := 1 / math.Sqrt(state.Direction[1]*state.Direction[1]+state.Direction[2]*state.Direction[2])
+			u0[1] = +nrm * state.Direction[2]
+			u0[2] = -nrm * state.Direction[0]
+		}
+	} else {
+		if a[1] > a[2] {
+			nrm := 1 / math.Sqrt(state.Direction[0]*state.Direction[0]+state.Direction[1]*state.Direction[1])
+			u0[0] = +nrm * state.Direction[1]
+			u0[1] = -nrm * state.Direction[0]
+		} else {
+			nrm := 1 / math.Sqrt(state.Direction[1]*state.Direction[1]+state.Direction[2]*state.Direction[2])
+			u0[1] = +nrm * state.Direction[2]
+			u0[2] = -nrm * state.Direction[1]
+		}
+	}
+
+	u1 := fmom.Vec3{
+		u0[0]*state.Direction[2] - u0[2]*state.Direction[1],
+		u0[2]*state.Direction[0] - u0[0]*state.Direction[2],
+		u0[1]*state.Direction[1] - u0[1]*state.Direction[0],
+	}
+
+	// apply the rotation
+	phi := 2 * math.Pi * ctx.Rand.Float64()
+	cp := math.Cos(phi)
+	sp := math.Sin(phi)
+
+	state.Direction[0] = ct*state.Direction[0] + st*(cp*u0[0]+sp*u1[0])
+	state.Direction[1] = ct*state.Direction[1] + st*(cp*u0[1]+sp*u1[1])
+	state.Direction[2] = ct*state.Direction[2] + st*(cp*u0[2]+sp*u1[2])
+
+	return
+}
+
+// kinetic returns the initial kinetic energy (in GeV) for the given total
+// grammage and material
+func kinetic(material MaterialKind, grammage float64) float64 {
+	mat := materials[material]
+	if grammage < mat.x[0] {
+		return 0
+	}
+
+	imax := len(mat.x) - 1
+	if grammage >= mat.x[imax] {
+		// constant loss model
+		a := mat.amax
+		b := mat.bmax
+		k0 := physK[imax]
+		k1 := a/b - muon.Mass
+		return k1 + (k0-k1)*math.Exp(b*(grammage-mat.x[imax]))
+	}
+
+	return linearInterpolate(mat.x[:], physK[:], grammage)
+}
+
+// energyLoss computes the energy loss per unit weight in GeV/(kg*m^-2)
+func energyLoss(material MaterialKind, kinetic float64) float64 {
+	if kinetic < physK[0] {
+		return 0
+	}
+
+	mat := materials[material]
+	imax := len(physK) - 1
+	if kinetic >= physK[imax] {
+		// constant loss model
+		return mat.amax + mat.bmax*(kinetic+muon.Mass)
+	}
+
+	return linearInterpolate(physK[:], mat.dE[:], kinetic)
+}
+
+// weightedTime returns the normalized proper time (in kg/m^2) for the given
+// material and kinetic energy
+func weightedTime(material MaterialKind, kinetic float64) float64 {
+	if kinetic < physK[0] {
+		return 0
+	}
+
+	mat := materials[material]
+	imax := len(physK) - 1
+	if kinetic >= physK[imax] {
+		// constant loss model
+		a := mat.amax
+		b := mat.bmax
+		e0 := physK[imax] + muon.Mass
+		e1 := kinetic + muon.Mass
+		return mat.t[imax] + muon.Mass/a*math.Log((e1/e0)*(a+b*e0)/(a+b*e1))
+	}
+
+	return linearInterpolate(physK[:], mat.t[:], kinetic)
+}
+
+// moliereScreening returns the Moliere fit of the angular screening for the
+// scattering DCS
+func moliereScreening(p, beta, z float64) float64 {
+	const third = 1.0 / 3.0
+	d := 2.10674530e-06 * math.Pow(z, third) / p
+	a := 7.29735257e-03 * z / beta
+	return d * d * (1.13 + 3.76*a*a)
+}
+
+// wentzelPath returns the scattering mean free path for a Wentzel DCS
+func wentzelPath(p, beta, z, a, screening float64) float64 {
+	d := p * beta / z
+	return a * 2.54910918e8 * screening * (1. + screening) * (d * d)
+}
+
+// wentzelTransport1 returns the 1st transport coefficient for a Wentzel DCS.
+func wentzelTransport1(screening float64) float64 {
+	a1 := 1.0 + screening
+	return 2.0 * screening * (a1*math.Log(a1/screening) - 1.)
+}
+
+// wentzelTransport2 returns the 2nd tranport coefficient for a Wentzel DCS
+func wentzelTransport2(screening float64) float64 {
+	a1 := 1. + screening
+	return 6. * screening * a1 * ((1.+2.*screening)*math.Log(a1/screening) - 2.)
 }
 
 func init() {

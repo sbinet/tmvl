@@ -11,6 +11,23 @@ import (
 
 const NMax = 3
 
+var (
+	media = []pumas.Medium{
+		{
+			Material:   pumas.DryAir,
+			Magnetized: false,
+			Density:    1.204,
+			Magnet:     fmom.Vec3{0, 0, 0},
+		},
+		{
+			Material:   pumas.StandardRock,
+			Magnetized: false,
+			Density:    1.5e3,
+			Magnet:     fmom.Vec3{0, 0, 0},
+		},
+	}
+)
+
 type Muon struct {
 	Energy    float64
 	Direction fmom.Vec3
@@ -85,8 +102,17 @@ func (mu *Muon) generate() error {
 	mu.Direction[1] *= norm
 	mu.Direction[2] *= norm
 
-	// FIXME(sbinet): initialize mini-geant4 config
-	mu.ctx = &pumas.Context{Rand: mu.rng, Data: mu}
+	mu.ctx = pumas.New()
+	mu.ctx.Rand = mu.rng
+	mu.ctx.Data = mu
+	mu.ctx.Step.Max = 10.0
+	mu.ctx.SetLocator(
+		func(ctx *pumas.Context, pos fmom.Vec3) int {
+			var geo Geometry
+			return geo.Medium(pos)
+		},
+		media,
+	)
 
 	return err
 }

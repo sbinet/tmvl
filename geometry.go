@@ -1,9 +1,17 @@
 package tmvl
 
+import (
+	"github.com/go-hep/fmom"
+)
+
 type Geometry struct {
 }
 
-func (geo *Geometry) Medium(x, y, z float64) int {
+func (geo *Geometry) Medium(pos fmom.Vec3) int {
+	x := pos.X()
+	y := pos.Y()
+	z := pos.Z()
+
 	// FIXME(sbinet): devise a more realistic implementation
 	// so far: a big 3d-block of 5m x 2000m x 5m
 	//         centered around the y-axis
