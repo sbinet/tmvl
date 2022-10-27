@@ -223,6 +223,12 @@ proploop:
 		istate.Kinetic = k
 		istate.Distance = dist
 		newIdx := ctx.stepThrough(locator, media, length, idx, charge, &istate, scattering, fwd)
+		log.Printf("---\nnew=%d\niold=%d\n state=%#v\nistate=%#v\n",
+			newIdx,
+			idx,
+			state,
+			istate,
+		)
 		state.Position = istate.Position
 		state.Direction = istate.Direction
 		if newIdx != idx {
